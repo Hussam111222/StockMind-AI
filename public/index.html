@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>StockMind AI — لوحة الإشارات اليومية</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">StockMind <span class="accent">AI</span></div>
+    <div class="topbar-right">
+      <span id="lastRun" class="mono muted">—</span>
+      <button id="refreshBtn" class="btn-outline">تحديث الآن</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="disclaimer" id="disclaimerBox">
+      هذه قراءة آلية للبيانات والأخبار المتاحة اليوم — مو ضمان ولا تنبؤ مؤكد بأداء السهم مستقبلًا. الأداة للاستخدام الشخصي، وقرار الشراء أو البيع النهائي راجع لك دائمًا.
+    </div>
+
+    <section class="columns">
+      <div class="column">
+        <div class="column-header rising">
+          <span class="dot"></span>
+          <h2>مرشّحة للشراء 📈</h2>
+        </div>
+        <div id="risingList" class="card-list"></div>
+      </div>
+
+      <div class="column">
+        <div class="column-header caution">
+          <span class="dot"></span>
+          <h2>يُنصح بتجنبها حاليًا ⚠️</h2>
+        </div>
+        <div id="cautionList" class="card-list"></div>
+      </div>
+    </section>
+
+    <section id="detailPanel" class="detail-panel hidden"></section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

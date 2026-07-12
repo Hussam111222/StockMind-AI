@@ -1,0 +1,10 @@
+[
+  { "ticker": "NVDA", "name": "NVIDIA Corp", "sector": "Semiconductors" },
+  { "ticker": "AAPL", "name": "Apple Inc", "sector": "Consumer Electronics" },
+  { "ticker": "MSFT", "name": "Microsoft Corp", "sector": "Software" },
+  { "ticker": "TSLA", "name": "Tesla Inc", "sector": "Automotive" },
+  { "ticker": "AMZN", "name": "Amazon.com", "sector": "E-commerce" },
+  { "ticker": "GOOGL", "name": "Alphabet Inc", "sector": "Internet" },
+  { "ticker": "META", "name": "Meta Platforms", "sector": "Social Media" },
+  { "ticker": "AMD", "name": "Advanced Micro Devices", "sector": "Semiconductors" }
+]
