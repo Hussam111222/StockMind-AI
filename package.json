@@ -1,0 +1,21 @@
+{
+  "name": "stockmind-ai-backend",
+  "version": "0.1.0",
+  "description": "StockMind AI - daily stock signal & news analysis backend (educational prototype, not licensed financial advice)",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "refresh": "node src/scheduler.js --once",
+    "refresh:news": "node src/scheduler.js --news-once"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3"
+  }
+}
