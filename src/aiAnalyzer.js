@@ -1,16 +1,62 @@
-const { anthropicApiKey, geminiApiKey, aiProvider } = require("./config");
+const {
+  anthropicApiKey,
+  geminiApiKey,
+  groqApiKey,
+  aiProvider,
+} = require("./config");
+
 const { fetchFinnhubNews } = require("./newsProvider");
 
+const GROQ_MODELS = [
+  "openai/gpt-oss-20b",
+  "openai/gpt-oss-120b",
+];
+
+const GEMINI_MODELS = [
+  "gemini-flash-latest",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+];
+
+let cachedGroqModel = null;
+let cachedGeminiModel = null;
+
 function parseJsonLoose(text) {
-  const clean = text.replace(/```json|```/g, "").trim();
+  const clean = text
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
   return JSON.parse(clean);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelayFromError(errorText, fallbackMs = 15000) {
+  const secondsMatch = errorText.match(
+    /retry(?:ing)?(?:\s+in|\s+after)?\s+(\d+(?:\.\d+)?)\s*s/i
+  );
+
+  if (secondsMatch) {
+    return Math.ceil(Number(secondsMatch[1]) * 1000) + 500;
+  }
+
+  const millisecondsMatch = errorText.match(
+    /retry(?:ing)?(?:\s+in|\s+after)?\s+(\d+)\s*ms/i
+  );
+
+  if (millisecondsMatch) {
+    return Number(millisecondsMatch[1]) + 500;
+  }
+
+  return fallbackMs;
 }
 
 async function callAnthropic({ prompt, useWebSearch }) {
   if (!anthropicApiKey) {
-    throw new Error(
-      "ANTHROPIC_API_KEY is not set — add it to .env, or switch AI_PROVIDER=gemini"
-    );
+    throw new Error("ANTHROPIC_API_KEY is not configured.");
   }
 
   const body = {
@@ -20,7 +66,12 @@ async function callAnthropic({ prompt, useWebSearch }) {
   };
 
   if (useWebSearch) {
-    body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+    body.tools = [
+      {
+        type: "web_search_20250305",
+        name: "web_search",
+      },
+    ];
   }
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -41,57 +92,128 @@ async function callAnthropic({ prompt, useWebSearch }) {
 
   const data = await res.json();
 
-  return data.content
+  return (data.content || [])
     .map((block) => (block.type === "text" ? block.text : ""))
     .join("")
     .trim();
 }
 
-// Gemini free-tier pacing:
-// ننتظر 13 ثانية بين كل طلب لتجنب تجاوز حد 5 طلبات بالدقيقة.
-const MIN_INTERVAL_MS = 13000;
-let lastCallAt = 0;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function callGroqModel(model, prompt) {
+  return fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${groqApiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Return only valid raw JSON. Do not use markdown code fences or add explanatory text.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      temperature: 0.2,
+      max_completion_tokens: 1000,
+      response_format: {
+        type: "json_object",
+      },
+    }),
+  });
 }
 
-async function paceGeminiCall() {
-  const wait = lastCallAt + MIN_INTERVAL_MS - Date.now();
-
-  if (wait > 0) {
-    await sleep(wait);
+async function callGroq({ prompt }, attempt = 1) {
+  if (!groqApiKey) {
+    throw new Error("GROQ_API_KEY is not configured.");
   }
 
-  lastCallAt = Date.now();
-}
+  const models = cachedGroqModel
+    ? [cachedGroqModel]
+    : GROQ_MODELS;
 
-function retryDelayFromError(errorText) {
-  const match = errorText.match(/retry in (\d+(\.\d+)?)s/i);
+  let lastError = null;
 
-  if (match) {
-    return Math.ceil(parseFloat(match[1]) * 1000) + 500;
-  }
+  for (const model of models) {
+    const res = await callGroqModel(model, prompt);
 
-  return MIN_INTERVAL_MS;
-}
+    if (res.status === 429) {
+      const errorText = await res.text();
 
-// Free-tier path — Gemini has no built-in live web search on the free tier,
-// so callers must feed it structured data such as Finnhub headlines.
-async function callGemini({ prompt }, attempt = 1) {
-  if (!geminiApiKey) {
-    throw new Error(
-      "GEMINI_API_KEY is not set — add it to .env, or switch AI_PROVIDER=anthropic"
+      if (attempt <= 3) {
+        const delay = retryDelayFromError(errorText, 10000);
+
+        console.log(
+          `[aiAnalyzer] Groq rate limited. Retrying in ${Math.round(
+            delay / 1000
+          )} seconds (attempt ${attempt}/3).`
+        );
+
+        await sleep(delay);
+
+        return callGroq({ prompt }, attempt + 1);
+      }
+
+      throw new Error(
+        `Groq API error 429 after retries: ${errorText}`
+      );
+    }
+
+    if (res.status === 404 || res.status === 400) {
+      const errorText = await res.text();
+
+      console.log(
+        `[aiAnalyzer] Groq model "${model}" unavailable. Trying next model.`
+      );
+
+      lastError = new Error(
+        `Groq API error ${res.status}: ${errorText}`
+      );
+
+      continue;
+    }
+
+    if (!res.ok) {
+      throw new Error(
+        `Groq API error ${res.status}: ${await res.text()}`
+      );
+    }
+
+    const data = await res.json();
+    const text =
+      data.choices?.[0]?.message?.content?.trim() || "";
+
+    if (!text) {
+      throw new Error(
+        `Groq model "${model}" returned an empty response.`
+      );
+    }
+
+    cachedGroqModel = model;
+
+    console.log(
+      `[aiAnalyzer] Groq model "${model}" confirmed working.`
     );
+
+    return text;
   }
 
-  await paceGeminiCall();
+  throw (
+    lastError ||
+    new Error("All configured Groq models are unavailable.")
+  );
+}
 
+async function callGeminiModel(model, prompt) {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `gemini-2.5-flash-lite:generateContent?key=${geminiApiKey}`;
+    `${model}:generateContent?key=${geminiApiKey}`;
 
-  const res = await fetch(url, {
+  return fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -102,70 +224,167 @@ async function callGemini({ prompt }, attempt = 1) {
           parts: [{ text: prompt }],
         },
       ],
+      generationConfig: {
+        responseMimeType: "application/json",
+      },
     }),
   });
+}
 
-  if (res.status === 429 && attempt <= 3) {
-    const errorText = await res.text();
-    const delay = retryDelayFromError(errorText);
+async function callGemini({ prompt }, attempt = 1) {
+  if (!geminiApiKey) {
+    throw new Error("GEMINI_API_KEY is not configured.");
+  }
+
+  const models = cachedGeminiModel
+    ? [cachedGeminiModel]
+    : GEMINI_MODELS;
+
+  let lastError = null;
+
+  for (const model of models) {
+    const res = await callGeminiModel(model, prompt);
+
+    if (res.status === 429) {
+      const errorText = await res.text();
+
+      if (attempt <= 3) {
+        const delay = retryDelayFromError(errorText, 15000);
+
+        console.log(
+          `[aiAnalyzer] Gemini rate limited. Retrying in ${Math.round(
+            delay / 1000
+          )} seconds (attempt ${attempt}/3).`
+        );
+
+        await sleep(delay);
+
+        return callGemini({ prompt }, attempt + 1);
+      }
+
+      throw new Error(
+        `Gemini API error 429 after retries: ${errorText}`
+      );
+    }
+
+    if (res.status === 404) {
+      const errorText = await res.text();
+
+      console.log(
+        `[aiAnalyzer] Gemini model "${model}" unavailable. Trying next model.`
+      );
+
+      lastError = new Error(
+        `Gemini API error 404: ${errorText}`
+      );
+
+      continue;
+    }
+
+    if (!res.ok) {
+      throw new Error(
+        `Gemini API error ${res.status}: ${await res.text()}`
+      );
+    }
+
+    const data = await res.json();
+
+    const text = (
+      data.candidates?.[0]?.content?.parts || []
+    )
+      .map((part) => part.text || "")
+      .join("")
+      .trim();
+
+    if (!text) {
+      throw new Error(
+        `Gemini model "${model}" returned an empty response.`
+      );
+    }
+
+    cachedGeminiModel = model;
 
     console.log(
-      `[aiAnalyzer] Gemini rate-limited, retrying in ${Math.round(
-        delay / 1000
-      )}s (attempt ${attempt}/3)…`
+      `[aiAnalyzer] Gemini model "${model}" confirmed working.`
     );
 
-    await sleep(delay);
-
-    return callGemini({ prompt }, attempt + 1);
+    return text;
   }
 
-  if (!res.ok) {
-    throw new Error(
-      `Gemini API error ${res.status}: ${await res.text()}`
-    );
-  }
-
-  const data = await res.json();
-  const parts = data.candidates?.[0]?.content?.parts || [];
-
-  return parts
-    .map((part) => part.text || "")
-    .join("")
-    .trim();
+  throw (
+    lastError ||
+    new Error("All configured Gemini models are unavailable.")
+  );
 }
 
 async function callAI({ prompt, useWebSearch }) {
-  if (aiProvider === "gemini") {
-    return callGemini({ prompt });
+  const errors = [];
+
+  const providerOrder =
+    aiProvider === "anthropic"
+      ? ["anthropic", "groq", "gemini"]
+      : aiProvider === "gemini"
+        ? ["gemini", "groq", "anthropic"]
+        : ["groq", "gemini", "anthropic"];
+
+  for (const provider of providerOrder) {
+    try {
+      if (provider === "groq" && groqApiKey) {
+        return await callGroq({ prompt });
+      }
+
+      if (provider === "gemini" && geminiApiKey) {
+        return await callGemini({ prompt });
+      }
+
+      if (provider === "anthropic" && anthropicApiKey) {
+        return await callAnthropic({
+          prompt,
+          useWebSearch,
+        });
+      }
+    } catch (error) {
+      errors.push(`${provider}: ${error.message}`);
+
+      console.error(
+        `[aiAnalyzer] ${provider} failed. Trying next configured provider:`,
+        error.message
+      );
+    }
   }
 
-  return callAnthropic({ prompt, useWebSearch });
+  throw new Error(
+    `All configured AI providers failed: ${errors.join(" | ")}`
+  );
 }
 
-// Real news, either from a dedicated financial news API or Anthropic web search.
 async function analyzeNews(ticker, name, sector) {
   let structured = null;
 
   try {
     structured = await fetchFinnhubNews(ticker);
-  } catch (err) {
+  } catch (error) {
     console.error(
       `[aiAnalyzer] Finnhub news fetch failed for ${ticker}:`,
-      err.message
+      error.message
     );
   }
 
-  const hasStructured = structured && structured.length > 0;
-  const canWebSearch = aiProvider === "anthropic";
-  const useWebSearch = !hasStructured && canWebSearch;
+  const hasStructured =
+    Array.isArray(structured) && structured.length > 0;
+
+  const canWebSearch =
+    aiProvider === "anthropic" && Boolean(anthropicApiKey);
+
+  const useWebSearch =
+    !hasStructured && canWebSearch;
 
   let sourceBlock;
 
   if (hasStructured) {
     sourceBlock =
-      `Here is real, structured recent news pulled from a financial news API — ` +
-      `base your analysis ONLY on this data, do not invent anything beyond it:\n` +
+      `Here is real structured recent news from a financial news API. ` +
+      `Base the analysis only on this data and do not invent information:\n` +
       structured
         .map(
           (news, index) =>
@@ -176,31 +395,35 @@ async function analyzeNews(ticker, name, sector) {
         .join("\n");
   } else if (useWebSearch) {
     sourceBlock =
-      `No structured news feed is configured — search the web for the most recent ` +
-      `news (last 24-48 hours) about ${ticker}.`;
+      `Search for the most recent news from the last 24 to 48 hours about ${ticker}.`;
   } else {
     sourceBlock =
-      `You have no live web access and no structured news feed for this run. ` +
-      `Do NOT invent or guess at recent headlines. Set "newsSentiment" to "Quiet" ` +
-      `and return an empty "headlines" array — it's fine and expected to say there's nothing to report today.`;
+      `There is no live news feed available for this run. ` +
+      `Do not invent headlines. Set "newsSentiment" to "Quiet", ` +
+      `use an honest summary, and return an empty "headlines" array.`;
   }
 
-  const prompt = `You are analyzing recent news for ${ticker} (${name}, ${sector} sector) stock.
+  const prompt = `Analyze recent news for ${ticker} (${name}, ${sector} sector).
+
 ${sourceBlock}
 
-Then respond with ONLY raw JSON, no markdown fences, no preamble, matching exactly this shape:
+Respond with only valid raw JSON matching exactly this structure:
 {
-  "newsSentiment": "Positive" | "Negative" | "Mixed" | "Quiet",
-  "summary": "<one or two plain-language sentences synthesizing what the recent news means for the stock>",
+  "newsSentiment": "Positive",
+  "summary": "One or two plain-language sentences.",
   "headlines": [
     {
-      "title": "<short headline paraphrase, not a verbatim quote>",
-      "source": "<publication name>",
-      "note": "<one short sentence on why it matters>"
+      "title": "Short headline paraphrase",
+      "source": "Publication name",
+      "note": "One short sentence explaining why it matters"
     }
   ]
 }
-Include up to 5 headlines. If you find little to no recent news, set newsSentiment to "Quiet" and return an empty headlines array.`;
+
+The only valid newsSentiment values are:
+"Positive", "Negative", "Mixed", or "Quiet".
+
+Include up to five headlines.`;
 
   const text = await callAI({
     prompt,
@@ -210,33 +433,40 @@ Include up to 5 headlines. If you find little to no recent news, set newsSentime
   return parseJsonLoose(text);
 }
 
-// Data-grounded narrative read for a personal watchlist tool.
 async function analyzeTechnicals(snapshot) {
   const stance =
     snapshot.classification === "rising"
       ? "buy candidate"
       : snapshot.classification === "caution"
-      ? "one to avoid for now"
-      : "neutral / mixed";
+        ? "one to avoid for now"
+        : "neutral / mixed";
 
   const ml = snapshot.mlPrediction || {};
 
   const mlLine =
     ml.sampleSize > 0
-      ? `Statistical model predicts: ${ml.direction} (confidence ${
-          ml.confidence
-        }/100), and this model's own rolling accuracy over its last ${
-          ml.sampleSize
-        } predictions is ${(ml.rollingAccuracy * 100).toFixed(0)}%.`
-      : `Statistical model predicts: ${ml.direction} (confidence ${ml.confidence}/100). Not enough history yet to report a rolling accuracy.`;
+      ? `The statistical model predicts ${ml.direction} with confidence ${ml.confidence}/100. Its rolling accuracy over the last ${ml.sampleSize} predictions is ${(ml.rollingAccuracy * 100).toFixed(0)}%.`
+      : `The statistical model predicts ${ml.direction} with confidence ${ml.confidence}/100. There is not enough prediction history yet to report rolling accuracy.`;
 
-  const prompt = `You are a personal research assistant inside a single-user stock-watchlist tool. Analyze this data snapshot and explain clearly WHY the data currently reads as a "${stance}". Be direct and specific about the reasoning, but stay honest: this is a same-day read of technicals + news + a simple statistical model, not a guarantee, so don't claim certainty about future price moves. If the statistical model's rolling accuracy is low or close to 50%, say so plainly instead of oversell it.
+  const prompt = `Analyze this stock snapshot and explain why it currently reads as "${stance}".
 
-Ticker: ${snapshot.ticker} (${snapshot.name}, ${snapshot.sector})
+Do not guarantee future performance. Use the specific figures provided.
+
+Ticker: ${snapshot.ticker}
+Company: ${snapshot.name}
+Sector: ${snapshot.sector}
 Last close: ${snapshot.last}
 RSI(14): ${snapshot.rsi.toFixed(1)}
-SMA50: ${snapshot.sma50 ? snapshot.sma50.toFixed(2) : "n/a"}
-SMA200: ${snapshot.sma200 ? snapshot.sma200.toFixed(2) : "n/a"}
+SMA50: ${
+    snapshot.sma50
+      ? snapshot.sma50.toFixed(2)
+      : "n/a"
+  }
+SMA200: ${
+    snapshot.sma200
+      ? snapshot.sma200.toFixed(2)
+      : "n/a"
+  }
 Trend cross: ${snapshot.trendSignal}
 20-day momentum: ${snapshot.momentum20.toFixed(2)}%
 News sentiment: ${snapshot.newsSentiment}
@@ -244,25 +474,25 @@ News summary: ${snapshot.newsSummary}
 ${mlLine}
 Composite classification: ${snapshot.classification}
 
-Respond with ONLY raw JSON, no markdown fences, no preamble:
+Respond with only valid raw JSON matching exactly this structure:
 {
-  "summary": "<two to three sentences stating clearly why this reads as a ${stance} today, referencing the specific numbers above including the statistical model's read>",
+  "summary": "Two or three sentences explaining the current read.",
   "factors": [
     {
       "label": "Momentum",
-      "note": "<one specific sentence, cite the actual number>"
+      "note": "One specific sentence using the actual momentum figure"
     },
     {
       "label": "Trend",
-      "note": "<one specific sentence, cite SMA/RSI>"
+      "note": "One specific sentence using the SMA or RSI figures"
     },
     {
       "label": "Statistical model",
-      "note": "<one specific sentence on the model's prediction and its own track record>"
+      "note": "One specific sentence about the model prediction and track record"
     },
     {
       "label": "News & risk",
-      "note": "<one specific sentence>"
+      "note": "One specific sentence"
     }
   ]
 }`;
